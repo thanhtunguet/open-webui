@@ -1,10 +1,72 @@
 import { browser, dev } from '$app/environment';
+import { env } from '$env/dynamic/public';
 // import { version } from '../../package.json';
 
 export const APP_NAME = 'Open WebUI';
 
-export const WEBUI_HOSTNAME = browser ? (dev ? `${location.hostname}:8080` : ``) : '';
-export const WEBUI_BASE_URL = browser ? (dev ? `http://${WEBUI_HOSTNAME}` : ``) : ``;
+export const WEBUI_BACKEND_URL_STORAGE_KEY = 'open-webui.backend-url';
+
+export const normalizeWebUIBaseUrl = (value: string | null | undefined) => {
+	const normalized = (value ?? '').trim().replace(/\/+$/, '');
+
+	if (!normalized) {
+		return '';
+	}
+
+	if (normalized.endsWith('/api/v1')) {
+		return normalized.slice(0, -'/api/v1'.length);
+	}
+
+	return normalized;
+};
+
+const getStoredWebUIBaseUrl = () => {
+	if (!browser) {
+		return '';
+	}
+
+	try {
+		return normalizeWebUIBaseUrl(localStorage.getItem(WEBUI_BACKEND_URL_STORAGE_KEY));
+	} catch {
+		return '';
+	}
+};
+
+const getConfiguredEnvBaseUrl = () => {
+	const publicApiBase = normalizeWebUIBaseUrl(env.PUBLIC_WEBUI_API_BASE_URL);
+	if (publicApiBase) {
+		return publicApiBase;
+	}
+
+	return normalizeWebUIBaseUrl(env.PUBLIC_WEBUI_BASE_URL);
+};
+
+const getDefaultWebUIBaseUrl = () => {
+	if (!browser) {
+		return '';
+	}
+
+	return dev ? `http://${location.hostname}:8080` : '';
+};
+
+export const WEBUI_BASE_URL = browser
+	? getStoredWebUIBaseUrl() || getConfiguredEnvBaseUrl() || getDefaultWebUIBaseUrl()
+	: '';
+
+export const WEBUI_HOSTNAME = browser
+	? (() => {
+			if (!WEBUI_BASE_URL) {
+				return dev ? `${location.hostname}:8080` : '';
+			}
+
+			try {
+				return new URL(WEBUI_BASE_URL).host;
+			} catch {
+				return '';
+			}
+		})()
+	: '';
+
 export const WEBUI_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1`;
 
 export const OLLAMA_API_BASE_URL = `${WEBUI_BASE_URL}/ollama`;
