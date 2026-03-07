@@ -99,8 +99,246 @@
 	let syncStatsEventData = null;
 
 	let heartbeatInterval = null;
+	let teardownAuthenticatedImageBridge = null;
 
 	const BREAKPOINT = 768;
+
+	const BACKEND_AUTH_IMAGE_PATTERNS = [
+		/^\/api\/v1\/users\/[^/]+\/profile\/image(?:$|[/?])/,
+		/^\/api\/v1\/models\/model\/profile\/image(?:$|[/?])/,
+		/^\/api\/v1\/channels\/webhooks\/[^/]+\/profile\/image(?:$|[/?])/,
+		/^\/api\/v1\/files\/[^/]+\/content(?:$|[/?])/
+	];
+
+	const authImageBlobUrlCache = new Map();
+
+	const getBackendAbsoluteImageUrl = (rawUrl) => {
+		if (!rawUrl) {
+			return null;
+		}
+
+		const trimmedUrl = rawUrl.trim();
+		if (!trimmedUrl || trimmedUrl.startsWith('data:') || trimmedUrl.startsWith('blob:')) {
+			return null;
+		}
+
+		if (trimmedUrl.startsWith('/api/v1/')) {
+			return WEBUI_BASE_URL ? `${WEBUI_BASE_URL}${trimmedUrl}` : null;
+		}
+
+		try {
+			const url = new URL(trimmedUrl, window.location.href);
+			const backendOrigin = WEBUI_BASE_URL ? new URL(WEBUI_BASE_URL).origin : '';
+			if (!backendOrigin || url.origin !== backendOrigin) {
+				return null;
+			}
+			return url.toString();
+		} catch {
+			return null;
+		}
+	};
+
+	const isBackendProtectedImageUrl = (rawUrl) => {
+		if (!rawUrl) {
+			return false;
+		}
+
+		const absoluteUrl = getBackendAbsoluteImageUrl(rawUrl);
+		if (!absoluteUrl) {
+			return false;
+		}
+
+		try {
+			const { pathname } = new URL(absoluteUrl);
+			return BACKEND_AUTH_IMAGE_PATTERNS.some((pattern) => pattern.test(pathname));
+		} catch {
+			return false;
+		}
+	};
+
+	const resolveAuthenticatedImageBlobUrl = async (rawUrl) => {
+		const absoluteUrl = getBackendAbsoluteImageUrl(rawUrl);
+		if (!absoluteUrl || !isBackendProtectedImageUrl(absoluteUrl)) {
+			return null;
+		}
+
+		const token = localStorage.getItem('token');
+		if (!token) {
+			return null;
+		}
+
+		if (!authImageBlobUrlCache.has(absoluteUrl)) {
+			authImageBlobUrlCache.set(
+				absoluteUrl,
+				(async () => {
+					const res = await fetch(absoluteUrl, {
+						headers: {
+							authorization: `Bearer ${token}`
+						},
+						credentials: 'include',
+						redirect: 'manual'
+					});
+
+					if ([301, 302, 307, 308].includes(res.status)) {
+						const location = res.headers.get('location');
+						if (location) {
+							return new URL(location, absoluteUrl).toString();
+						}
+					}
+
+					if (!res.ok) {
+						throw new Error(`Failed to fetch protected image: ${res.status}`);
+					}
+
+					const blob = await res.blob();
+					return URL.createObjectURL(blob);
+				})()
+					.catch(() => null)
+					.then((value) => {
+						if (!value) {
+							authImageBlobUrlCache.delete(absoluteUrl);
+						}
+						return value;
+					})
+			);
+		}
+
+		return await authImageBlobUrlCache.get(absoluteUrl);
+	};
+
+	const applyAuthImageSource = async (img) => {
+		const source = img.getAttribute('src');
+		if (!source || !isBackendProtectedImageUrl(source)) {
+			return;
+		}
+
+		if (img.dataset.authImageSource === source) {
+			return;
+		}
+
+		img.dataset.authImageSource = source;
+		const blobUrl = await resolveAuthenticatedImageBlobUrl(source);
+		if (blobUrl && img.dataset.authImageSource === source) {
+			img.src = blobUrl;
+		}
+	};
+
+	const applyAuthBackgroundImageSource = async (element) => {
+		const styleValue = element.style?.backgroundImage ?? '';
+		if (!styleValue.includes('url(') || element.dataset.authBackgroundSource === styleValue) {
+			return;
+		}
+
+		const matches = [...styleValue.matchAll(/url\((['"]?)(.*?)\1\)/g)];
+		if (matches.length === 0) {
+			return;
+		}
+
+		let transformedStyle = styleValue;
+		let transformed = false;
+
+		for (const match of matches) {
+			const url = match[2];
+			if (!isBackendProtectedImageUrl(url)) {
+				continue;
+			}
+
+			const blobUrl = await resolveAuthenticatedImageBlobUrl(url);
+			if (!blobUrl) {
+				continue;
+			}
+
+			transformedStyle = transformedStyle.replace(url, blobUrl);
+			transformed = true;
+		}
+
+		if (transformed) {
+			element.dataset.authBackgroundSource = styleValue;
+			element.style.backgroundImage = transformedStyle;
+		}
+	};
+
+	const initializeAuthenticatedImageBridge = () => {
+		if (!WEBUI_BASE_URL) {
+			return () => {};
+		}
+
+		let backendOrigin = '';
+		try {
+			backendOrigin = new URL(WEBUI_BASE_URL).origin;
+		} catch {
+			return () => {};
+		}
+
+		if (backendOrigin === window.location.origin) {
+			return () => {};
+		}
+
+		const processNode = (node) => {
+			if (!(node instanceof Element)) {
+				return;
+			}
+
+			if (node instanceof HTMLImageElement) {
+				applyAuthImageSource(node);
+			}
+			if (node.hasAttribute('style')) {
+				applyAuthBackgroundImageSource(node);
+			}
+
+			node.querySelectorAll('img').forEach((img) => {
+				applyAuthImageSource(img);
+			});
+			node.querySelectorAll('[style*="url("]').forEach((element) => {
+				applyAuthBackgroundImageSource(element);
+			});
+		};
+
+		const observer = new MutationObserver((mutations) => {
+			for (const mutation of mutations) {
+				if (mutation.type === 'childList') {
+					mutation.addedNodes.forEach(processNode);
+					continue;
+				}
+
+				if (mutation.type === 'attributes') {
+					const target = mutation.target;
+					if (!(target instanceof Element)) {
+						continue;
+					}
+
+					if (mutation.attributeName === 'src' && target instanceof HTMLImageElement) {
+						applyAuthImageSource(target);
+					}
+
+					if (mutation.attributeName === 'style') {
+						applyAuthBackgroundImageSource(target);
+					}
+				}
+			}
+		});
+
+		processNode(document.body);
+
+		observer.observe(document.documentElement, {
+			childList: true,
+			subtree: true,
+			attributes: true,
+			attributeFilter: ['src', 'style']
+		});
+
+		return () => {
+			observer.disconnect();
+			for (const blobUrlPromise of authImageBlobUrlCache.values()) {
+				Promise.resolve(blobUrlPromise).then((blobUrl) => {
+					if (blobUrl?.startsWith('blob:')) {
+						URL.revokeObjectURL(blobUrl);
+					}
+				});
+			}
+			authImageBlobUrlCache.clear();
+		};
+	};
 
 	const setupSocket = async (enableWebsocket) => {
 		const _socket = io(`${WEBUI_BASE_URL}` || undefined, {
@@ -656,6 +894,7 @@
 
 	onMount(async () => {
 		window.addEventListener('message', windowMessageEventHandler);
+		teardownAuthenticatedImageBridge = initializeAuthenticatedImageBridge();
 
 		let touchstartY = 0;
 
@@ -894,11 +1133,13 @@
 			document.removeEventListener('touchmove', touchmoveHandler);
 			document.removeEventListener('touchend', touchendHandler);
 			document.removeEventListener('visibilitychange', handleVisibilityChange);
+			teardownAuthenticatedImageBridge?.();
 		};
 	});
 
 	onDestroy(() => {
 		bc.close();
+		teardownAuthenticatedImageBridge?.();
 	});
 </script>
 
